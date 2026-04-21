@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Generic Airline — Seat Selection</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #f4f6fa;
+    color: #1a2332;
+    font-size: 12px;
+  }
+  body {
+    padding: 8px;
+    max-width: 460px;
+    margin: 0 auto;
+  }
+
+  .confirm-banner {
+    background: #EEF4FF;
+    border: 2px solid #003087;
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin-bottom: 8px;
+    text-align: center;
+    transition: all 0.2s ease;
+  }
+  .confirm-banner.selected {
+    background: #D4EDDA;
+    border-color: #28A745;
+  }
+  .confirm-banner .label {
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #555;
+    margin-bottom: 2px;
+  }
+  .confirm-banner .value {
+    font-size: 18px;
+    font-weight: 700;
+    color: #003087;
+    font-family: 'SF Mono', 'Courier New', monospace;
+    letter-spacing: 0.04em;
+  }
+  .confirm-banner.selected .value { color: #1B5E20; }
+  .confirm-banner .sub {
+    font-size: 10px;
+    color: #555;
+    margin-top: 2px;
+  }
+  .confirm-banner .copy-hint {
+    font-size: 9px;
+    color: #003087;
+    font-weight: 700;
+    margin-top: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .legend {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    justify-content: center;
+    margin-bottom: 6px;
+    padding: 5px 6px;
+    background: #fff;
+    border-radius: 4px;
+    border: 1px solid #e0e6ed;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    font-size: 9px;
+    font-weight: 600;
+  }
+  .legend-swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    border: 1px solid;
+  }
+
+  .cabin {
+    background: #fff;
+    border-radius: 5px;
+    padding: 6px 8px;
+    margin-bottom: 4px;
+    border: 1px solid #e0e6ed;
+  }
+  .cabin-header {
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 4px;
+    padding-bottom: 3px;
+    border-bottom: 1px dashed #ccd4e0;
+  }
+  .col-headers {
+    display: flex;
+    gap: 2px;
+    justify-content: center;
+    margin-bottom: 2px;
+    padding-left: 18px;
+  }
+  .col-headers span {
+    width: 22px;
+    font-size: 8px;
+    font-weight: 700;
+    color: #888;
+    text-align: center;
+  }
+  .col-headers .gap-spacer { width: 10px; }
+
+  .row {
+    display: flex;
+    gap: 2px;
+    justify-content: center;
+    align-items: center;
+    margin-bottom: 2px;
+  }
+  .row-num {
+    width: 18px;
+    font-size: 8px;
+    font-weight: 700;
+    color: #666;
+    text-align: right;
+    padding-right: 3px;
+  }
+  .row .gap-spacer { width: 10px; }
+
+  .seat {
+    width: 22px;
+    height: 22px;
+    border-radius: 3px;
+    border: 1px solid;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 8px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: all 0.12s ease;
+    flex-shrink: 0;
+    user-select: none;
+  }
+  .seat:hover:not(.taken):not(.selected) {
+    transform: scale(1.15);
+    box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+    z-index: 10;
+  }
+
+  .seat.fc { background: #F3E5F5; border-color: #9C27B0; color: #4A148C; }
+  .seat.xl { background: #E3F2FD; border-color: #2196F3; color: #0D47A1; }
+  .seat.ex { background: #FFF3CD; border-color: #FFC107; color: #795548; }
+  .seat.av { background: #E8F5E9; border-color: #4CAF50; color: #2E7D32; }
+
+  .seat.taken {
+    background: #ddd !important;
+    border-color: #bbb !important;
+    color: #999 !important;
+    cursor: not-allowed;
+  }
+  .seat.taken::after { content: "✕"; font-size: 8px; }
+
+  .seat.selected {
+    background: #003087 !important;
+    border-color: #003087 !important;
+    color: #fff !important;
+    transform: scale(1.18);
+    box-shadow: 0 3px 8px rgba(0,48,135,0.5);
+  }
+
+  .nose {
+    text-align: center;
+    font-size: 8px;
+    font-weight: 700;
+    color: #003087;
+    padding: 4px 0;
+    background: #fff;
+    border-radius: 5px 5px 0 0;
+    border: 1px solid #e0e6ed;
+    border-bottom: none;
+    letter-spacing: 0.15em;
+  }
+  .nose::after { content: " ▲ FRONT"; }
+
+  .footer-note {
+    font-size: 9px;
+    color: #888;
+    text-align: center;
+    margin-top: 6px;
+    font-style: italic;
+    padding-bottom: 4px;
+  }
+</style>
+</head>
+<body>
+
+<div class="confirm-banner" id="confirmBanner">
+  <div class="label">Your Selection</div>
+  <div class="value" id="seatValue">— Tap a seat below —</div>
+  <div class="sub" id="seatDetail">First Class · Extra Legroom · Exit Row · Economy</div>
+</div>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-swatch" style="background:#F3E5F5;border-color:#9C27B0"></div>First</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#E3F2FD;border-color:#2196F3"></div>Legroom</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#FFF3CD;border-color:#FFC107"></div>Exit Row</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#E8F5E9;border-color:#4CAF50"></div>Economy</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#ddd;border-color:#bbb"></div>Taken</div>
+</div>
+
+<div class="nose">CABIN</div>
+<div id="seatMap"></div>
+
+<div class="footer-note">After selecting, type your seat code into the chat input field.</div>
+
+<script>
+  const COLS = ['A', 'B', 'C', 'D', 'E', 'F'];
+  const TAKEN = {
+    1: ['B','E'], 2: ['A','F'], 3: ['C'], 4: ['D','E'],
+    5: ['A','B'], 6: ['F'], 7: ['C','D'], 8: ['A'],
+    9: ['B','E','F'], 10: ['D'], 11: ['A','C'], 12: ['B','F'],
+    13: ['E'], 14: ['A'], 15: ['C','D'], 16: ['B'],
+    17: ['A','F'], 18: ['C','E'], 19: ['D'], 20: ['B','C','F']
+  };
+  const CABINS = [
+    { type: 'fc', label: 'First Class · Included', rows: [1,2,3,4], price: 0 },
+    { type: 'xl', label: 'Extra Legroom · +$45',   rows: [5,6],     price: 45 },
+    { type: 'av', label: 'Economy · +$15',         rows: [7,8,9,10,11,12,13], price: 15 },
+    { type: 'ex', label: 'Exit Row · +$40',        rows: [14,15],   price: 40 },
+    { type: 'av', label: 'Economy · +$15',         rows: [16,17,18,19,20], price: 15 },
+  ];
+  const CABIN_NAMES = { fc: 'First Class', xl: 'Extra Legroom', ex: 'Exit Row', av: 'Economy' };
+
+  function buildMap() {
+    const map = document.getElementById('seatMap');
+    let html = '';
+
+    CABINS.forEach((cabin, idx) => {
+      html += `<div class="cabin">`;
+      html += `<div class="cabin-header" style="color:${getCabinColor(cabin.type)}">${cabin.label}</div>`;
+
+      if (idx === 0) {
+        html += `<div class="col-headers">`;
+        html += `<span>A</span><span>B</span><span>C</span>`;
+        html += `<span class="gap-spacer"></span>`;
+        html += `<span>D</span><span>E</span><span>F</span>`;
+        html += `</div>`;
+      }
+
+      cabin.rows.forEach(rowNum => {
+        html += `<div class="row">`;
+        html += `<span class="row-num">${rowNum}</span>`;
+        COLS.forEach((col, colIdx) => {
+          const isTaken = (TAKEN[rowNum] || []).includes(col);
+          const cls = isTaken ? `${cabin.type} taken` : cabin.type;
+          const data = `data-row="${rowNum}" data-col="${col}" data-cabin="${cabin.type}" data-price="${cabin.price}"`;
+          html += `<div class="seat ${cls}" ${data}>${isTaken ? '' : col}</div>`;
+          if (colIdx === 2) html += `<span class="gap-spacer"></span>`;
+        });
+        html += `</div>`;
+      });
+      html += `</div>`;
+    });
+
+    map.innerHTML = html;
+    attachClicks();
+  }
+
+  function getCabinColor(type) {
+    return { fc: '#9C27B0', xl: '#2196F3', ex: '#795548', av: '#2E7D32' }[type];
+  }
+
+  function attachClicks() {
+    document.querySelectorAll('.seat:not(.taken)').forEach(seat => {
+      seat.addEventListener('click', () => selectSeat(seat));
+    });
+  }
+
+  function selectSeat(seat) {
+    document.querySelectorAll('.seat.selected').forEach(s => s.classList.remove('selected'));
+    seat.classList.add('selected');
+
+    const row = seat.dataset.row;
+    const col = seat.dataset.col;
+    const cabin = seat.dataset.cabin;
+    const price = parseInt(seat.dataset.price, 10);
+    const seatCode = `${row}${col}`;
+    const cabinName = CABIN_NAMES[cabin];
+    const priceText = price === 0 ? 'Included' : `+$${price}`;
+
+    const banner = document.getElementById('confirmBanner');
+    banner.classList.add('selected');
+    document.getElementById('seatValue').textContent = seatCode;
+    document.getElementById('seatDetail').innerHTML =
+      `<strong>${cabinName}</strong> · ${priceText}` +
+      `<div class="copy-hint">↓ Type "${seatCode}" into the chat input ↓</div>`;
+
+    try {
+      window.parent.postMessage({
+        source: 'airline-seat-map',
+        seat: seatCode,
+        cabin: cabin,
+        cabinName: cabinName,
+        price: price,
+        row: parseInt(row, 10),
+        column: col
+      }, '*');
+    } catch (e) { /* ignore */ }
+  }
+
+  buildMap();
+</script>
+
+</body>
+</html>
