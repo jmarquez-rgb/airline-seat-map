@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Generic Airline — Seat Selection</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f4f6fa; color: #1a2332; font-size: 13px; min-height: 100vh; }
+  body { padding: 16px; max-width: 520px; margin: 0 auto; }
+  .header { background: linear-gradient(135deg, #003087 0%, #0050C8 100%); border-radius: 10px; padding: 16px 20px; margin-bottom: 12px; color: #fff; }
+  .header h1 { font-size: 18px; font-weight: 700; }
+  .header .meta { font-size: 11px; color: #A0C4FF; margin-top: 3px; letter-spacing: 0.04em; }
+  .confirm-banner { background: #EEF4FF; border: 2px solid #003087; border-radius: 8px; padding: 10px 14px; margin-bottom: 10px; text-align: center; transition: all 0.25s ease; }
+  .confirm-banner.selected { background: #D4EDDA; border-color: #28A745; }
+  .confirm-banner .label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: #555; margin-bottom: 3px; }
+  .confirm-banner .value { font-size: 22px; font-weight: 700; color: #003087; font-family: 'SF Mono', 'Courier New', monospace; letter-spacing: 0.05em; }
+  .confirm-banner.selected .value { color: #1B5E20; }
+  .confirm-banner .sub { font-size: 11px; color: #555; margin-top: 3px; }
+  .continue-btn { display: none; width: 100%; padding: 12px; background: linear-gradient(135deg, #28A745 0%, #218838 100%); color: #fff; border: none; border-radius: 8px; font-size: 14px; font-weight: 700; cursor: pointer; margin: 10px 0; box-shadow: 0 2px 6px rgba(40, 167, 69, 0.3); transition: transform 0.15s ease, box-shadow 0.15s ease; }
+  .continue-btn:hover { transform: translateY(-1px); box-shadow: 0 4px 10px rgba(40, 167, 69, 0.4); }
+  .continue-btn.visible { display: block; }
+  .continue-btn:disabled { opacity: 0.7; cursor: not-allowed; }
+  .legend { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-bottom: 8px; padding: 6px 8px; background: #fff; border-radius: 6px; border: 1px solid #e0e6ed; }
+  .legend-item { display: flex; align-items: center; gap: 4px; font-size: 10px; font-weight: 600; }
+  .legend-swatch { width: 12px; height: 12px; border-radius: 2px; border: 1px solid; }
+  .cabin { background: #fff; border-radius: 6px; padding: 8px 10px; margin-bottom: 6px; border: 1px solid #e0e6ed; }
+  .cabin-header { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 5px; padding-bottom: 4px; border-bottom: 1px dashed #ccd4e0; }
+  .col-headers { display: flex; gap: 2px; justify-content: center; margin-bottom: 3px; padding-left: 20px; }
+  .col-headers span { width: 26px; font-size: 9px; font-weight: 700; color: #888; text-align: center; }
+  .col-headers .gap-spacer { width: 12px; }
+  .row { display: flex; gap: 2px; justify-content: center; align-items: center; margin-bottom: 2px; }
+  .row-num { width: 20px; font-size: 9px; font-weight: 700; color: #666; text-align: right; padding-right: 3px; }
+  .row .gap-spacer { width: 12px; }
+  .seat { width: 26px; height: 26px; border-radius: 3px; border: 1px solid; display: flex; align-items: center; justify-content: center; font-size: 9px; font-weight: 700; cursor: pointer; transition: all 0.12s ease; flex-shrink: 0; user-select: none; }
+  .seat:hover:not(.taken):not(.selected) { transform: scale(1.15); box-shadow: 0 2px 6px rgba(0,0,0,0.2); z-index: 10; }
+  .seat.fc { background: #F3E5F5; border-color: #9C27B0; color: #4A148C; }
+  .seat.xl { background: #E3F2FD; border-color: #2196F3; color: #0D47A1; }
+  .seat.ex { background: #FFF3CD; border-color: #FFC107; color: #795548; }
+  .seat.av { background: #E8F5E9; border-color: #4CAF50; color: #2E7D32; }
+  .seat.taken { background: #ddd !important; border-color: #bbb !important; color: #999 !important; cursor: not-allowed; }
+  .seat.taken::after { content: "\2715"; font-size: 9px; }
+  .seat.selected { background: #003087 !important; border-color: #003087 !important; color: #fff !important; transform: scale(1.2); box-shadow: 0 3px 8px rgba(0,48,135,0.5); }
+  .nose { text-align: center; font-size: 9px; font-weight: 700; color: #003087; padding: 5px 0; background: #fff; border-radius: 6px 6px 0 0; border: 1px solid #e0e6ed; border-bottom: none; letter-spacing: 0.15em; }
+  .nose::after { content: " \25B2 FRONT"; }
+  .footer-note { font-size: 10px; color: #888; text-align: center; margin-top: 8px; font-style: italic; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>&#9992; Select Your Seat</h1>
+  <div class="meta">Flight [FLIGHT #] &middot; [ORIGIN] &rarr; [DESTINATION] &middot; [DATE]</div>
+</div>
+<div class="confirm-banner" id="confirmBanner">
+  <div class="label">Your Selection</div>
+  <div class="value" id="seatValue">&mdash; Tap a seat below &mdash;</div>
+  <div class="sub" id="seatDetail">First Class &middot; Extra Legroom &middot; Exit Row &middot; Economy</div>
+</div>
+<button class="continue-btn" id="continueBtn">Continue to Chat &rarr;</button>
+<div class="legend">
+  <div class="legend-item"><div class="legend-swatch" style="background:#F3E5F5;border-color:#9C27B0"></div>First</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#E3F2FD;border-color:#2196F3"></div>Legroom</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#FFF3CD;border-color:#FFC107"></div>Exit Row</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#E8F5E9;border-color:#4CAF50"></div>Economy</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#ddd;border-color:#bbb"></div>Taken</div>
+</div>
+<div class="nose">CABIN</div>
+<div id="seatMap"></div>
+<div class="footer-note">Your selection is automatically shared with the chat when you continue.</div>
+<script>
+  const COLS = ['A','B','C','D','E','F'];
+  const TAKEN = { 1:['B','E'],2:['A','F'],3:['C'],4:['D','E'],5:['A','B'],6:['F'],7:['C','D'],8:['A'],9:['B','E','F'],10:['D'],11:['A','C'],12:['B','F'],13:['E'],14:['A'],15:['C','D'],16:['B'],17:['A','F'],18:['C','E'],19:['D'],20:['B','C','F'] };
+  const CABINS = [
+    { type:'fc', label:'First Class \u00b7 Included', rows:[1,2,3,4], price:0 },
+    { type:'xl', label:'Extra Legroom \u00b7 +$45',   rows:[5,6],     price:45 },
+    { type:'av', label:'Economy \u00b7 +$15',         rows:[7,8,9,10,11,12,13], price:15 },
+    { type:'ex', label:'Exit Row \u00b7 +$40',        rows:[14,15],   price:40 },
+    { type:'av', label:'Economy \u00b7 +$15',         rows:[16,17,18,19,20], price:15 },
+  ];
+  const CABIN_NAMES = { fc:'First Class', xl:'Extra Legroom', ex:'Exit Row', av:'Economy' };
+  let currentSelection = null;
+
+  function buildMap() {
+    const map = document.getElementById('seatMap');
+    let html = '';
+    CABINS.forEach((cabin, idx) => {
+      html += '<div class="cabin">';
+      html += '<div class="cabin-header" style="color:' + getCabinColor(cabin.type) + '">' + cabin.label + '</div>';
+      if (idx === 0) {
+        html += '<div class="col-headers"><span>A</span><span>B</span><span>C</span><span class="gap-spacer"></span><span>D</span><span>E</span><span>F</span></div>';
+      }
+      cabin.rows.forEach(rowNum => {
+        html += '<div class="row"><span class="row-num">' + rowNum + '</span>';
+        COLS.forEach((col, colIdx) => {
+          const isTaken = (TAKEN[rowNum] || []).includes(col);
+          const cls = isTaken ? (cabin.type + ' taken') : cabin.type;
+          const data = 'data-row="' + rowNum + '" data-col="' + col + '" data-cabin="' + cabin.type + '" data-price="' + cabin.price + '"';
+          html += '<div class="seat ' + cls + '" ' + data + '>' + (isTaken ? '' : col) + '</div>';
+          if (colIdx === 2) html += '<span class="gap-spacer"></span>';
+        });
+        html += '</div>';
+      });
+      html += '</div>';
+    });
+    map.innerHTML = html;
+    attachClicks();
+  }
+
+  function getCabinColor(type) {
+    return { fc:'#9C27B0', xl:'#2196F3', ex:'#795548', av:'#2E7D32' }[type];
+  }
+
+  function attachClicks() {
+    document.querySelectorAll('.seat:not(.taken)').forEach(seat => {
+      seat.addEventListener('click', () => selectSeat(seat));
+    });
+  }
+
+  function selectSeat(seat) {
+    document.querySelectorAll('.seat.selected').forEach(s => s.classList.remove('selected'));
+    seat.classList.add('selected');
+    const row = seat.dataset.row, col = seat.dataset.col, cabin = seat.dataset.cabin;
+    const price = parseInt(seat.dataset.price, 10);
+    const seatCode = row + col;
+    const cabinName = CABIN_NAMES[cabin];
+    const priceText = price === 0 ? 'Included' : ('+$' + price);
+
+    currentSelection = {
+      selectedSeat: seatCode,
+      selectedCabin: cabin,
+      selectedCabinName: cabinName,
+      selectedSeatPrice: price,
+      selectedSeatRow: parseInt(row, 10),
+      selectedSeatColumn: col
+    };
+
+    const banner = document.getElementById('confirmBanner');
+    banner.classList.add('selected');
+    document.getElementById('seatValue').textContent = seatCode;
+    document.getElementById('seatDetail').innerHTML = '<strong>' + cabinName + '</strong> &middot; ' + priceText;
+    document.getElementById('continueBtn').classList.add('visible');
+  }
+
+  document.getElementById('continueBtn').addEventListener('click', () => {
+    if (!currentSelection) return;
+    launchThrioWidget(currentSelection);
+  });
+
+  function launchThrioWidget(selection) {
+    // Thrio widget connector params
+    // Context values become available in the survey as ${workitem.data?.<key>}
+    window.thrioParams = {
+      host: 'astonvilla.thrio.io',
+      tenantId: 'nextivase11',
+      campaignId: '67f55aa7312c5d6534ab530d',
+      trace: true,
+      context: {
+        selectedSeat: selection.selectedSeat,
+        selectedCabin: selection.selectedCabin,
+        selectedCabinName: selection.selectedCabinName,
+        selectedSeatPrice: selection.selectedSeatPrice,
+        selectedSeatRow: selection.selectedSeatRow,
+        selectedSeatColumn: selection.selectedSeatColumn
+      }
+    };
+
+    // Dynamic script load ensures window.thrioParams is set BEFORE connector runs
+    const script = document.createElement('script');
+    script.src = 'https://storage.googleapis.com/thrio-public-prod-files/thriowidgets-1.2.1.js';
+    script.type = 'module';
+    document.head.appendChild(script);
+
+    const btn = document.getElementById('continueBtn');
+    btn.textContent = 'Loading chat\u2026';
+    btn.disabled = true;
+  }
+
+  buildMap();
+</script>
+</body>
+</html>
