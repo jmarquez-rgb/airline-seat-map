@@ -3,179 +3,297 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Generic Airline — Seat Selection</title>
+<title>Generic Airline — Seat Assistant</title>
+<!--
+  ============================================================================
+  AI-FIRST SEAT ASSISTANT  ->  NCC (Thrio) ESCALATION
+  ============================================================================
+  The page owns the conversation. Claude handles self-service against a tool
+  layer; NCC is loaded only when the conversation needs a human.
+
+  Everything is driven by URL query params so one hosted page serves every
+  scenario. See README.md for the full list. Quick reference:
+
+    ?pnr=JX4K2P&flight=NX482&from=PHX&to=JFK&date=2026-10-04
+    &name=Jordan%20Marquez&tier=Gold
+    &debug=1              show the NCC payload inspector
+    &ai=live&proxy=URL    use the real Claude API through your proxy
+    &handoff=iframe       embed the NCC survey directly instead of the widget
+
+  Four seams are marked with banner comments below:
+    [SEAM 1] BOOKING + SEAT DATA   - replace with your inventory API
+    [SEAM 2] TOOL LAYER            - replace mock implementations with real calls
+    [SEAM 3] AI ENGINE             - mock brain vs. live Claude via proxy
+    [SEAM 4] NCC HANDOFF           - the escalation payload and launch
+  ============================================================================
+-->
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f4f6fa; color: #1a2332; font-size: 13px; min-height: 100vh; }
-  body { padding: 16px; max-width: 520px; margin: 0 auto; }
-  .header { background: linear-gradient(135deg, #003087 0%, #0050C8 100%); border-radius: 10px; padding: 16px 20px; margin-bottom: 12px; color: #fff; }
-  .header h1 { font-size: 18px; font-weight: 700; }
-  .header .meta { font-size: 11px; color: #A0C4FF; margin-top: 3px; letter-spacing: 0.04em; }
-  .confirm-banner { background: #EEF4FF; border: 2px solid #003087; border-radius: 8px; padding: 10px 14px; margin-bottom: 10px; text-align: center; transition: all 0.25s ease; }
-  .confirm-banner.selected { background: #D4EDDA; border-color: #28A745; }
-  .confirm-banner .label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: #555; margin-bottom: 3px; }
-  .confirm-banner .value { font-size: 22px; font-weight: 700; color: #003087; font-family: 'SF Mono', 'Courier New', monospace; letter-spacing: 0.05em; }
-  .confirm-banner.selected .value { color: #1B5E20; }
-  .confirm-banner .sub { font-size: 11px; color: #555; margin-top: 3px; }
-  .continue-btn { display: none; width: 100%; padding: 12px; background: linear-gradient(135deg, #28A745 0%, #218838 100%); color: #fff; border: none; border-radius: 8px; font-size: 14px; font-weight: 700; cursor: pointer; margin: 10px 0; box-shadow: 0 2px 6px rgba(40, 167, 69, 0.3); transition: transform 0.15s ease, box-shadow 0.15s ease; }
-  .continue-btn:hover { transform: translateY(-1px); box-shadow: 0 4px 10px rgba(40, 167, 69, 0.4); }
-  .continue-btn.visible { display: block; }
-  .continue-btn:disabled { opacity: 0.7; cursor: not-allowed; }
-  .legend { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-bottom: 8px; padding: 6px 8px; background: #fff; border-radius: 6px; border: 1px solid #e0e6ed; }
-  .legend-item { display: flex; align-items: center; gap: 4px; font-size: 10px; font-weight: 600; }
-  .legend-swatch { width: 12px; height: 12px; border-radius: 2px; border: 1px solid; }
-  .cabin { background: #fff; border-radius: 6px; padding: 8px 10px; margin-bottom: 6px; border: 1px solid #e0e6ed; }
-  .cabin-header { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 5px; padding-bottom: 4px; border-bottom: 1px dashed #ccd4e0; }
-  .col-headers { display: flex; gap: 2px; justify-content: center; margin-bottom: 3px; padding-left: 20px; }
-  .col-headers span { width: 26px; font-size: 9px; font-weight: 700; color: #888; text-align: center; }
-  .col-headers .gap-spacer { width: 12px; }
-  .row { display: flex; gap: 2px; justify-content: center; align-items: center; margin-bottom: 2px; }
-  .row-num { width: 20px; font-size: 9px; font-weight: 700; color: #666; text-align: right; padding-right: 3px; }
-  .row .gap-spacer { width: 12px; }
-  .seat { width: 26px; height: 26px; border-radius: 3px; border: 1px solid; display: flex; align-items: center; justify-content: center; font-size: 9px; font-weight: 700; cursor: pointer; transition: all 0.12s ease; flex-shrink: 0; user-select: none; }
-  .seat:hover:not(.taken):not(.selected) { transform: scale(1.15); box-shadow: 0 2px 6px rgba(0,0,0,0.2); z-index: 10; }
-  .seat.fc { background: #F3E5F5; border-color: #9C27B0; color: #4A148C; }
-  .seat.xl { background: #E3F2FD; border-color: #2196F3; color: #0D47A1; }
-  .seat.ex { background: #FFF3CD; border-color: #FFC107; color: #795548; }
-  .seat.av { background: #E8F5E9; border-color: #4CAF50; color: #2E7D32; }
-  .seat.taken { background: #ddd !important; border-color: #bbb !important; color: #999 !important; cursor: not-allowed; }
-  .seat.taken::after { content: "\2715"; font-size: 9px; }
-  .seat.selected { background: #003087 !important; border-color: #003087 !important; color: #fff !important; transform: scale(1.2); box-shadow: 0 3px 8px rgba(0,48,135,0.5); }
-  .nose { text-align: center; font-size: 9px; font-weight: 700; color: #003087; padding: 5px 0; background: #fff; border-radius: 6px 6px 0 0; border: 1px solid #e0e6ed; border-bottom: none; letter-spacing: 0.15em; }
-  .nose::after { content: " \25B2 FRONT"; }
-  .footer-note { font-size: 10px; color: #888; text-align: center; margin-top: 8px; font-style: italic; }
+  :root {
+    --brand:#003087; --brand-2:#0050C8; --brand-soft:#EEF4FF;
+    --ink:#1a2332; --muted:#5b6b7f; --line:#e0e6ed; --bg:#f4f6fa;
+    --ok:#1e7e34; --ok-soft:#D4EDDA; --warn:#B26A00; --warn-soft:#FFF3CD;
+    --ai:#5B3FA8; --ai-soft:#F1ECFB;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  html,body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+    background:var(--bg); color:var(--ink); font-size:13px; }
+  body { min-height:100vh; }
+
+  /* ---------- top bar ---------- */
+  .topbar { background:linear-gradient(135deg,var(--brand) 0%,var(--brand-2) 100%); color:#fff; padding:12px 18px; }
+  .topbar-inner { max-width:1120px; margin:0 auto; display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+  .topbar h1 { font-size:16px; font-weight:700; letter-spacing:-0.01em; }
+  .flightstrip { display:flex; gap:8px; flex-wrap:wrap; margin-left:auto; }
+  .chip { background:rgba(255,255,255,0.15); border:1px solid rgba(255,255,255,0.25);
+    border-radius:20px; padding:3px 10px; font-size:11px; font-weight:600; white-space:nowrap; }
+  .chip b { font-weight:700; font-family:'SF Mono','Courier New',monospace; letter-spacing:0.03em; }
+
+  /* ---------- mobile tabs ---------- */
+  .tabs { display:none; max-width:1120px; margin:10px auto 0; padding:0 14px; gap:6px; }
+  .tabs button { flex:1; padding:9px; border:1px solid var(--line); background:#fff; color:var(--muted);
+    font-size:12px; font-weight:700; border-radius:8px; cursor:pointer; position:relative; }
+  .tabs button.active { background:var(--brand); color:#fff; border-color:var(--brand); }
+  .tabs button .dot { position:absolute; top:6px; right:10px; width:7px; height:7px; border-radius:50%;
+    background:#E53935; display:none; }
+  .tabs button .dot.on { display:block; }
+
+  /* ---------- layout ---------- */
+  .layout { max-width:1120px; margin:0 auto; padding:14px; display:grid;
+    grid-template-columns:minmax(0,420px) minmax(0,1fr); gap:14px; align-items:start; }
+  .panel { background:#fff; border:1px solid var(--line); border-radius:12px; overflow:hidden; }
+  .panel-head { padding:10px 14px; border-bottom:1px solid var(--line); display:flex;
+    align-items:center; gap:8px; }
+  .panel-head h2 { font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:0.07em; color:var(--muted); }
+  .panel-body { padding:12px 14px; }
+
+  /* ---------- seat map ---------- */
+  .seatstatus { margin:0 0 10px; border-radius:8px; padding:9px 12px; text-align:center;
+    background:var(--brand-soft); border:2px solid var(--brand); transition:all .2s ease; }
+  .seatstatus.assigned { background:var(--ok-soft); border-color:var(--ok); }
+  .seatstatus .lbl { font-size:9px; font-weight:700; text-transform:uppercase; letter-spacing:0.1em; color:var(--muted); }
+  .seatstatus .val { font-size:21px; font-weight:700; color:var(--brand);
+    font-family:'SF Mono','Courier New',monospace; letter-spacing:0.05em; line-height:1.25; }
+  .seatstatus.assigned .val { color:var(--ok); }
+  .seatstatus .sub { font-size:11px; color:var(--muted); }
+
+  .legend { display:flex; gap:7px; flex-wrap:wrap; justify-content:center; margin-bottom:9px; }
+  .legend-item { display:flex; align-items:center; gap:4px; font-size:9.5px; font-weight:600; color:var(--muted); }
+  .sw { width:11px; height:11px; border-radius:2px; border:1px solid; }
+
+  .nose { text-align:center; font-size:9px; font-weight:700; color:var(--brand); padding:4px 0;
+    letter-spacing:0.15em; border-bottom:1px dashed var(--line); margin-bottom:6px; }
+  .cabin { margin-bottom:7px; }
+  .cabin-header { font-size:9.5px; font-weight:700; text-transform:uppercase; letter-spacing:0.06em;
+    margin-bottom:4px; padding-bottom:3px; border-bottom:1px dashed #ccd4e0; }
+  .col-headers { display:flex; gap:2px; justify-content:center; margin-bottom:3px; padding-left:20px; }
+  .col-headers span { width:26px; font-size:9px; font-weight:700; color:#9aa7b5; text-align:center; }
+  .col-headers .gap { width:12px; }
+  .row { display:flex; gap:2px; justify-content:center; align-items:center; margin-bottom:2px; }
+  .row-num { width:20px; font-size:9px; font-weight:700; color:#9aa7b5; text-align:right; padding-right:3px; }
+  .row .gap { width:12px; }
+  .seat { width:26px; height:26px; border-radius:3px; border:1px solid; display:flex; align-items:center;
+    justify-content:center; font-size:9px; font-weight:700; cursor:pointer; transition:transform .1s ease;
+    flex-shrink:0; user-select:none; padding:0; font-family:inherit; }
+  .seat:hover:not(:disabled) { transform:scale(1.15); box-shadow:0 2px 6px rgba(0,0,0,.2); z-index:5; }
+  .seat:focus-visible { outline:2px solid var(--brand); outline-offset:1px; z-index:6; }
+  .seat.fc { background:#F3E5F5; border-color:#9C27B0; color:#4A148C; }
+  .seat.xl { background:#E3F2FD; border-color:#2196F3; color:#0D47A1; }
+  .seat.ex { background:#FFF3CD; border-color:#FFC107; color:#795548; }
+  .seat.av { background:#E8F5E9; border-color:#4CAF50; color:#2E7D32; }
+  .seat.taken { background:#dde2e8; border-color:#c3ccd6; color:#9aa7b5; cursor:not-allowed; }
+  .seat.mine { background:#fff; border:2px dashed var(--brand); color:var(--brand); }
+  .seat.selected { background:var(--brand); border-color:var(--brand); color:#fff;
+    transform:scale(1.18); box-shadow:0 3px 8px rgba(0,48,135,.45); }
+  .seat.suggested { animation:pulse 1.4s ease-in-out infinite; box-shadow:0 0 0 2px rgba(91,63,168,.55); }
+  @keyframes pulse { 0%,100%{box-shadow:0 0 0 2px rgba(91,63,168,.55);} 50%{box-shadow:0 0 0 5px rgba(91,63,168,.15);} }
+  .maplock { font-size:10px; color:var(--muted); text-align:center; margin-top:8px; font-style:italic; }
+
+  /* ---------- chat ---------- */
+  .chat-panel { display:flex; flex-direction:column; min-height:560px; }
+  .ai-badge { background:var(--ai-soft); color:var(--ai); font-size:9.5px; font-weight:700;
+    padding:2px 7px; border-radius:10px; text-transform:uppercase; letter-spacing:0.06em; }
+  .agent-badge { background:var(--ok-soft); color:var(--ok); font-size:9.5px; font-weight:700;
+    padding:2px 7px; border-radius:10px; text-transform:uppercase; letter-spacing:0.06em; }
+  .msgs { flex:1; overflow-y:auto; padding:14px; display:flex; flex-direction:column; gap:10px;
+    max-height:60vh; scroll-behavior:smooth; }
+  /* column flex items shrink once the list overflows - that squashes cards to slivers */
+  .msgs > * { flex-shrink:0; }
+  .msg { display:flex; gap:8px; max-width:88%; }
+  .msg.user { align-self:flex-end; flex-direction:row-reverse; }
+  .avatar { width:24px; height:24px; border-radius:50%; flex-shrink:0; display:flex; align-items:center;
+    justify-content:center; font-size:11px; font-weight:700; }
+  .msg.ai .avatar { background:var(--ai-soft); color:var(--ai); }
+  .msg.user .avatar { background:var(--brand-soft); color:var(--brand); }
+  .bubble { padding:9px 12px; border-radius:12px; line-height:1.5; font-size:12.5px; }
+  .msg.ai .bubble { background:#f2f4f8; border-bottom-left-radius:3px; }
+  .msg.user .bubble { background:var(--brand); color:#fff; border-bottom-right-radius:3px; }
+  .msg.system { align-self:center; max-width:100%; }
+  .msg.system .bubble { background:var(--warn-soft); color:var(--warn); font-size:11px;
+    text-align:center; border-radius:8px; font-weight:600; }
+
+  .thinking { display:flex; gap:4px; padding:10px 12px; }
+  .thinking span { width:6px; height:6px; border-radius:50%; background:#b9c2cd; animation:bounce 1.2s infinite; }
+  .thinking span:nth-child(2){animation-delay:.15s} .thinking span:nth-child(3){animation-delay:.3s}
+  @keyframes bounce { 0%,60%,100%{transform:translateY(0);opacity:.5} 30%{transform:translateY(-4px);opacity:1} }
+
+  .toolcall { align-self:flex-start; font-size:10px; color:var(--muted); font-family:'SF Mono','Courier New',monospace;
+    background:#f7f8fa; border:1px dashed var(--line); border-radius:6px; padding:4px 8px; max-width:88%; }
+  .toolcall b { color:var(--ai); font-weight:700; }
+
+  /* ---------- cards (adaptive-card style) ---------- */
+  .card { border:1px solid var(--line); border-radius:10px; overflow:hidden; background:#fff; max-width:88%;
+    align-self:flex-start; box-shadow:0 1px 3px rgba(16,24,40,.06); }
+  .card-head { padding:8px 12px; background:#fafbfc; border-bottom:1px solid var(--line);
+    font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:0.07em; color:var(--muted); }
+  .card-body { padding:10px 12px; }
+  .opt { display:flex; align-items:center; gap:10px; padding:8px; border:1px solid var(--line);
+    border-radius:8px; margin-bottom:7px; }
+  .opt:last-child { margin-bottom:0; }
+  .opt-seat { font-family:'SF Mono','Courier New',monospace; font-size:16px; font-weight:700;
+    color:var(--brand); min-width:42px; text-align:center; }
+  .opt-info { flex:1; min-width:0; }
+  .opt-info .t { font-weight:700; font-size:12px; }
+  .opt-info .d { font-size:10.5px; color:var(--muted); margin-top:1px; }
+  .opt-price { font-size:12px; font-weight:700; white-space:nowrap; }
+  .opt-price.free { color:var(--ok); }
+  .btn { border:none; border-radius:7px; padding:7px 12px; font-size:11.5px; font-weight:700;
+    cursor:pointer; font-family:inherit; white-space:nowrap; }
+  .btn-primary { background:var(--brand); color:#fff; }
+  .btn-primary:hover { background:var(--brand-2); }
+  .btn-ok { background:var(--ok); color:#fff; }
+  .btn-ghost { background:#fff; color:var(--brand); border:1px solid var(--brand); }
+  .btn:disabled { opacity:.55; cursor:not-allowed; }
+  .btn-wide { width:100%; padding:10px; font-size:13px; margin-top:8px; }
+  .kv { display:flex; justify-content:space-between; gap:14px; padding:4px 0; font-size:12px; border-bottom:1px dashed #eef1f5; }
+  .kv:last-child { border-bottom:none; }
+  .kv .k { color:var(--muted); }
+  .kv .v { font-weight:700; }
+  .kv.total { border-top:1px solid var(--line); margin-top:4px; padding-top:7px; border-bottom:none; }
+  .card.escalate { border-color:var(--warn); }
+  .card.escalate .card-head { background:var(--warn-soft); color:var(--warn); }
+  .handoff-list { font-size:11px; color:var(--muted); line-height:1.7; margin:6px 0 0; padding-left:16px; }
+  .handoff-list code { font-family:'SF Mono','Courier New',monospace; font-size:10px; color:var(--ai); }
+
+  /* ---------- composer ---------- */
+  .quickies { display:flex; gap:6px; flex-wrap:wrap; padding:0 14px 8px; }
+  .quickies button { background:#fff; border:1px solid var(--brand); color:var(--brand); font-size:11px;
+    font-weight:600; padding:5px 10px; border-radius:14px; cursor:pointer; font-family:inherit; }
+  .quickies button:hover { background:var(--brand-soft); }
+  .composer { border-top:1px solid var(--line); padding:10px 14px; display:flex; gap:8px; }
+  .composer input { flex:1; border:1px solid var(--line); border-radius:8px; padding:9px 12px;
+    font-size:12.5px; font-family:inherit; }
+  .composer input:focus { outline:none; border-color:var(--brand); }
+
+  /* ---------- NCC mount ---------- */
+  #nccHost { position:fixed; bottom:16px; right:16px; width:380px; height:560px; max-width:calc(100vw - 32px);
+    max-height:calc(100vh - 32px); z-index:2147483000; display:none; border-radius:12px; overflow:hidden;
+    box-shadow:0 12px 40px rgba(16,24,40,.28); background:#fff; border:1px solid var(--line); }
+  #nccHost.on { display:block; }
+  #nccHost .ncc-bar { height:34px; background:var(--brand); color:#fff; display:flex; align-items:center;
+    justify-content:space-between; padding:0 12px; font-size:11.5px; font-weight:700; }
+  #nccHost .ncc-bar button { background:none; border:none; color:#fff; font-size:16px; cursor:pointer; line-height:1; }
+  #nccHost iframe { width:100%; height:calc(100% - 34px); border:none; display:block; }
+
+  /* ---------- debug ---------- */
+  #debug { position:fixed; left:0; right:0; bottom:0; background:#0f1720; color:#d6e0ea; z-index:2147483100;
+    font-family:'SF Mono','Courier New',monospace; font-size:11px; display:none; max-height:44vh; }
+  #debug.on { display:flex; flex-direction:column; }
+  #debug .dbg-tabs { display:flex; border-bottom:1px solid #26333f; flex-shrink:0; }
+  #debug .dbg-tabs button { background:none; border:none; color:#7f8ea0; padding:7px 14px; cursor:pointer;
+    font-family:inherit; font-size:11px; font-weight:700; }
+  #debug .dbg-tabs button.active { color:#6ee7b7; border-bottom:2px solid #6ee7b7; }
+  #debug .dbg-tabs .spacer { margin-left:auto; display:flex; align-items:center; gap:10px; padding-right:12px; }
+  #debug .size { font-size:10px; color:#7f8ea0; }
+  #debug .size.warn { color:#fbbf24; }
+  #debug pre { margin:0; padding:12px; overflow:auto; flex:1; line-height:1.55; white-space:pre-wrap;
+    word-break:break-word; }
+  .dbg-toggle { position:fixed; right:14px; bottom:14px; z-index:2147483099; background:#0f1720; color:#6ee7b7;
+    border:none; border-radius:18px; padding:7px 13px; font-size:11px; font-weight:700; cursor:pointer;
+    font-family:'SF Mono','Courier New',monospace; display:none; box-shadow:0 3px 10px rgba(0,0,0,.25); }
+  .dbg-toggle.on { display:block; }
+  /* keep the inspector from covering the composer it is meant to explain */
+  body.debug-open { padding-bottom:46vh; }
+
+  @media (max-width:880px) {
+    .layout { grid-template-columns:1fr; }
+    .tabs { display:flex; }
+    .layout.tab-seats .chat-panel { display:none; }
+    .layout.tab-chat .seatmap-panel { display:none; }
+    .flightstrip { margin-left:0; width:100%; }
+    #nccHost { width:calc(100vw - 20px); height:calc(100vh - 20px); bottom:10px; right:10px; }
+  }
 </style>
 </head>
 <body>
-<div class="header">
-  <h1>&#9992; Select Your Seat</h1>
-  <div class="meta">Flight [FLIGHT #] &middot; [ORIGIN] &rarr; [DESTINATION] &middot; [DATE]</div>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <h1>&#9992;&#65039; Generic Airline</h1>
+    <div class="flightstrip" id="flightStrip"></div>
+  </div>
+</header>
+
+<div class="tabs" id="tabs">
+  <button data-tab="seats" class="active">Seat Map</button>
+  <button data-tab="chat">Assistant<span class="dot" id="chatDot"></span></button>
 </div>
-<div class="confirm-banner" id="confirmBanner">
-  <div class="label">Your Selection</div>
-  <div class="value" id="seatValue">&mdash; Tap a seat below &mdash;</div>
-  <div class="sub" id="seatDetail">First Class &middot; Extra Legroom &middot; Exit Row &middot; Economy</div>
+
+<main class="layout tab-seats" id="layout">
+
+  <section class="panel seatmap-panel">
+    <div class="panel-head"><h2>Cabin &amp; Seat Map</h2></div>
+    <div class="panel-body">
+      <div class="seatstatus" id="seatStatus">
+        <div class="lbl">Your seat</div>
+        <div class="val" id="seatVal">&mdash;</div>
+        <div class="sub" id="seatSub">&nbsp;</div>
+      </div>
+      <div class="legend">
+        <div class="legend-item"><div class="sw" style="background:#F3E5F5;border-color:#9C27B0"></div>First</div>
+        <div class="legend-item"><div class="sw" style="background:#E3F2FD;border-color:#2196F3"></div>Legroom</div>
+        <div class="legend-item"><div class="sw" style="background:#FFF3CD;border-color:#FFC107"></div>Exit</div>
+        <div class="legend-item"><div class="sw" style="background:#E8F5E9;border-color:#4CAF50"></div>Economy</div>
+        <div class="legend-item"><div class="sw" style="background:#dde2e8;border-color:#c3ccd6"></div>Taken</div>
+      </div>
+      <div class="nose">&#9650; FRONT OF AIRCRAFT</div>
+      <div id="seatMap"></div>
+      <div class="maplock" id="mapLock"></div>
+    </div>
+  </section>
+
+  <section class="panel chat-panel">
+    <div class="panel-head">
+      <h2 id="chatTitle">Travel Assistant</h2>
+      <span class="ai-badge" id="chatBadge">AI &middot; Self-service</span>
+    </div>
+    <div class="msgs" id="msgs"></div>
+    <div class="quickies" id="quickies"></div>
+    <form class="composer" id="composer" autocomplete="off">
+      <input id="input" placeholder="Ask about seats, bags, upgrades&hellip;" aria-label="Message">
+      <button class="btn btn-primary" type="submit">Send</button>
+    </form>
+  </section>
+
+</main>
+
+<div id="nccHost">
+  <div class="ncc-bar"><span>Live Agent &mdash; Generic Airline</span><button id="nccClose" aria-label="Close">&times;</button></div>
+  <iframe id="nccFrame" title="NCC Live Chat" allow="fullscreen"></iframe>
 </div>
-<button class="continue-btn" id="continueBtn">Continue to Chat &rarr;</button>
-<div class="legend">
-  <div class="legend-item"><div class="legend-swatch" style="background:#F3E5F5;border-color:#9C27B0"></div>First</div>
-  <div class="legend-item"><div class="legend-swatch" style="background:#E3F2FD;border-color:#2196F3"></div>Legroom</div>
-  <div class="legend-item"><div class="legend-swatch" style="background:#FFF3CD;border-color:#FFC107"></div>Exit Row</div>
-  <div class="legend-item"><div class="legend-swatch" style="background:#E8F5E9;border-color:#4CAF50"></div>Economy</div>
-  <div class="legend-item"><div class="legend-swatch" style="background:#ddd;border-color:#bbb"></div>Taken</div>
+
+<button class="dbg-toggle" id="dbgToggle">&#9679; NCC payload</button>
+<div id="debug">
+  <div class="dbg-tabs">
+    <button data-d="ctx" class="active">Context &rarr; NCC</button>
+    <button data-d="tools">Tool calls</button>
+    <button data-d="tx">Transcript</button>
+    <div class="spacer">
+      <span class="size" id="dbgSize"></span>
+      <button data-d="close" style="color:#f87171">close</button>
+    </div>
+  </div>
+  <pre id="dbgOut"></pre>
 </div>
-<div class="nose">CABIN</div>
-<div id="seatMap"></div>
-<div class="footer-note">Your selection is automatically shared with the chat when you continue.</div>
+
 <script>
-  const COLS = ['A','B','C','D','E','F'];
-  const TAKEN = { 1:['B','E'],2:['A','F'],3:['C'],4:['D','E'],5:['A','B'],6:['F'],7:['C','D'],8:['A'],9:['B','E','F'],10:['D'],11:['A','C'],12:['B','F'],13:['E'],14:['A'],15:['C','D'],16:['B'],17:['A','F'],18:['C','E'],19:['D'],20:['B','C','F'] };
-  const CABINS = [
-    { type:'fc', label:'First Class \u00b7 Included', rows:[1,2,3,4], price:0 },
-    { type:'xl', label:'Extra Legroom \u00b7 +$45',   rows:[5,6],     price:45 },
-    { type:'av', label:'Economy \u00b7 +$15',         rows:[7,8,9,10,11,12,13], price:15 },
-    { type:'ex', label:'Exit Row \u00b7 +$40',        rows:[14,15],   price:40 },
-    { type:'av', label:'Economy \u00b7 +$15',         rows:[16,17,18,19,20], price:15 },
-  ];
-  const CABIN_NAMES = { fc:'First Class', xl:'Extra Legroom', ex:'Exit Row', av:'Economy' };
-  let currentSelection = null;
-
-  function buildMap() {
-    const map = document.getElementById('seatMap');
-    let html = '';
-    CABINS.forEach((cabin, idx) => {
-      html += '<div class="cabin">';
-      html += '<div class="cabin-header" style="color:' + getCabinColor(cabin.type) + '">' + cabin.label + '</div>';
-      if (idx === 0) {
-        html += '<div class="col-headers"><span>A</span><span>B</span><span>C</span><span class="gap-spacer"></span><span>D</span><span>E</span><span>F</span></div>';
-      }
-      cabin.rows.forEach(rowNum => {
-        html += '<div class="row"><span class="row-num">' + rowNum + '</span>';
-        COLS.forEach((col, colIdx) => {
-          const isTaken = (TAKEN[rowNum] || []).includes(col);
-          const cls = isTaken ? (cabin.type + ' taken') : cabin.type;
-          const data = 'data-row="' + rowNum + '" data-col="' + col + '" data-cabin="' + cabin.type + '" data-price="' + cabin.price + '"';
-          html += '<div class="seat ' + cls + '" ' + data + '>' + (isTaken ? '' : col) + '</div>';
-          if (colIdx === 2) html += '<span class="gap-spacer"></span>';
-        });
-        html += '</div>';
-      });
-      html += '</div>';
-    });
-    map.innerHTML = html;
-    attachClicks();
-  }
-
-  function getCabinColor(type) {
-    return { fc:'#9C27B0', xl:'#2196F3', ex:'#795548', av:'#2E7D32' }[type];
-  }
-
-  function attachClicks() {
-    document.querySelectorAll('.seat:not(.taken)').forEach(seat => {
-      seat.addEventListener('click', () => selectSeat(seat));
-    });
-  }
-
-  function selectSeat(seat) {
-    document.querySelectorAll('.seat.selected').forEach(s => s.classList.remove('selected'));
-    seat.classList.add('selected');
-    const row = seat.dataset.row, col = seat.dataset.col, cabin = seat.dataset.cabin;
-    const price = parseInt(seat.dataset.price, 10);
-    const seatCode = row + col;
-    const cabinName = CABIN_NAMES[cabin];
-    const priceText = price === 0 ? 'Included' : ('+$' + price);
-
-    currentSelection = {
-      selectedSeat: seatCode,
-      selectedCabin: cabin,
-      selectedCabinName: cabinName,
-      selectedSeatPrice: price,
-      selectedSeatRow: parseInt(row, 10),
-      selectedSeatColumn: col
-    };
-
-    const banner = document.getElementById('confirmBanner');
-    banner.classList.add('selected');
-    document.getElementById('seatValue').textContent = seatCode;
-    document.getElementById('seatDetail').innerHTML = '<strong>' + cabinName + '</strong> &middot; ' + priceText;
-    document.getElementById('continueBtn').classList.add('visible');
-  }
-
-  document.getElementById('continueBtn').addEventListener('click', () => {
-    if (!currentSelection) return;
-    launchThrioWidget(currentSelection);
-  });
-
-  function launchThrioWidget(selection) {
-    // Thrio widget connector params
-    // Context values become available in the survey as ${workitem.data?.<key>}
-    window.thrioParams = {
-      host: 'astonvilla.thrio.io',
-      tenantId: 'nextivase11',
-      campaignId: '67f55aa7312c5d6534ab530d',
-      trace: true,
-      context: {
-        selectedSeat: selection.selectedSeat,
-        selectedCabin: selection.selectedCabin,
-        selectedCabinName: selection.selectedCabinName,
-        selectedSeatPrice: selection.selectedSeatPrice,
-        selectedSeatRow: selection.selectedSeatRow,
-        selectedSeatColumn: selection.selectedSeatColumn
-      }
-    };
-
-    // Dynamic script load ensures window.thrioParams is set BEFORE connector runs
-    const script = document.createElement('script');
-    script.src = 'https://storage.googleapis.com/thrio-public-prod-files/thriowidgets-1.2.1.js';
-    script.type = 'module';
-    document.head.appendChild(script);
-
-    const btn = document.getElementById('continueBtn');
-    btn.textContent = 'Loading chat\u2026';
-    btn.disabled = true;
-  }
-
-  buildMap();
-</script>
-</body>
-</html>
+"use strict";
