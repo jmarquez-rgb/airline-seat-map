@@ -208,7 +208,7 @@
   #debug pre { margin:0; padding:12px; overflow:auto; flex:1; line-height:1.55; white-space:pre-wrap;
     word-break:break-word; }
   .dbg-toggle { position:fixed; right:14px; bottom:14px; z-index:2147483099; background:#0f1720; color:#6ee7b7;
-    border:none; border-radius:18px; padding:7px 13px; font-size:11px; font-weight:700; cursor:pointer;
+               border:none; border-radius:18px; padding:7px 13px; font-size:11px; font-weight:700; cursor:pointer;
     font-family:'SF Mono','Courier New',monospace; display:none; box-shadow:0 3px 10px rgba(0,0,0,.25); }
   .dbg-toggle.on { display:block; }
   /* keep the inspector from covering the composer it is meant to explain */
@@ -297,3 +297,964 @@
 
 <script>
 "use strict";
+
+/* ===========================================================================
+   [SEAM 1]  BOOKING + SEAT DATA
+   ---------------------------------------------------------------------------
+   Today: booking comes from URL params, inventory is a static map.
+   To go live: replace CONFIG defaults with a booking lookup, and replace
+   SEAT_INVENTORY with a fetch() of your availability service.
+   =========================================================================== */
+
+const qs = new URLSearchParams(location.search);
+const param = (k, d) => (qs.get(k) || d);
+
+const BOOKING = {
+  pnr:        param('pnr', 'JX4K2P'),
+  flight:     param('flight', 'NX482'),
+  origin:     param('from', 'PHX'),
+  destination:param('to', 'JFK'),
+  date:       param('date', '2026-10-04'),
+  name:       param('name', 'Jordan Marquez'),
+  email:      param('email', ''),
+  tier:       param('tier', 'Gold'),
+  fareClass:  param('fare', 'Main Cabin'),
+  currentSeat:param('seat', '18E')
+};
+
+const CONFIG = {
+  aiMode:   param('ai', 'mock'),                 // 'mock' | 'live'
+  proxyUrl: param('proxy', ''),                  // your serverless proxy endpoint
+  model:    param('model', 'claude-opus-5'),
+  handoff:  param('handoff', 'widget'),          // 'widget' | 'iframe'
+  debug:    qs.get('debug') === '1',
+  ncc: {
+    protocol:  'https',
+    host:      param('host', 'astonvilla.thrio.io'),
+    tenantId:  param('tenant', 'nextivase11'),
+    campaignId:param('campaign', '67f55aa7312c5d6534ab530d'),
+    trace:     true
+  }
+};
+
+// Cabin bands. `price` is the change fee shown to the customer.
+const CABINS = [
+  { type:'fc', name:'First Class',     label:'First Class',           rows:[1,2,3,4],             price:189, pitch:'38"' },
+  { type:'xl', name:'Extra Legroom',   label:'Extra Legroom · +$45', rows:[5,6],             price:45,  pitch:'34"' },
+  { type:'av', name:'Economy',         label:'Economy · +$15',   rows:[7,8,9,10,11,12,13],   price:15,  pitch:'31"' },
+  { type:'ex', name:'Exit Row',        label:'Exit Row · +$40',  rows:[14,15],               price:40,  pitch:'36"' },
+  { type:'av', name:'Economy',         label:'Economy · +$15',   rows:[16,17,18,19,20],      price:15,  pitch:'31"' }
+];
+
+const COLS = ['A','B','C','D','E','F'];
+const OCCUPIED = { 1:['B','E'],2:['A','F'],3:['C'],4:['D','E'],5:['A','B'],6:['F'],7:['C','D'],
+  8:['A'],9:['B','E','F'],10:['D'],11:['A','C'],12:['B','F'],13:['E'],14:['A'],15:['C','D'],
+  16:['B'],17:['A','F'],18:['C','E'],19:['D'],20:['B','C','F'] };
+
+function buildInventory() {
+  const seats = {};
+  CABINS.forEach(cab => cab.rows.forEach(row => COLS.forEach(col => {
+    const code = row + col;
+    const exitRow = cab.type === 'ex';
+    seats[code] = {
+      code, row, col, cabin:cab.type, cabinName:cab.name, price:cab.price, pitch:cab.pitch,
+      window: col === 'A' || col === 'F',
+      aisle:  col === 'C' || col === 'D',
+      middle: col === 'B' || col === 'E',
+      exitRow,
+      extraLegroom: cab.type === 'xl' || exitRow || cab.type === 'fc',
+      noRecline: row === 13 || row === 20,
+      nearLav: row >= 19,
+      occupied: (OCCUPIED[row] || []).includes(col)
+    };
+  })));
+  return seats;
+}
+const SEAT_INVENTORY = buildInventory();
+
+function seatTraits(s) {
+  const t = [];
+  if (s.window) t.push('Window'); else if (s.aisle) t.push('Aisle'); else t.push('Middle');
+  if (s.exitRow) t.push('Exit row');
+  else if (s.extraLegroom && s.cabin !== 'fc') t.push('Extra legroom');
+  if (s.cabin === 'fc') t.push('Lie-flat');
+  if (s.noRecline) t.push('No recline');
+  if (s.nearLav) t.push('Near lavatory');
+  return t;
+}
+
+/* ===========================================================================
+   APPLICATION STATE
+   =========================================================================== */
+
+const STORE_KEY = 'ga.seat.' + BOOKING.pnr;
+
+const state = {
+  assignedSeat: BOOKING.currentSeat,   // what the booking currently holds
+  pendingSeat:  null,                  // highlighted / proposed, not yet assigned
+  suggested:    [],                    // seats the AI is pointing at
+  escalated:    false,                 // NCC has been engaged
+  turns:        0,
+  unresolved:   0,                     // consecutive turns with no progress
+  transcript:   [],                    // {role, text} for the handoff summary
+  toolLog:      [],
+  messages:     [],                    // Claude-format history (live mode)
+  lastPayload:  null
+};
+
+try {
+  const saved = JSON.parse(localStorage.getItem(STORE_KEY) || 'null');
+  if (saved && SEAT_INVENTORY[saved.assignedSeat]) state.assignedSeat = saved.assignedSeat;
+} catch (_) { /* storage unavailable - fall back to the booking's seat */ }
+
+function persist() {
+  try { localStorage.setItem(STORE_KEY, JSON.stringify({ assignedSeat: state.assignedSeat })); }
+  catch (_) { /* private mode - selection simply won't survive reload */ }
+}
+
+/* ===========================================================================
+   [SEAM 2]  TOOL LAYER
+   ---------------------------------------------------------------------------
+   These schemas are sent verbatim to Claude in live mode. Each `run` is the
+   mock implementation - swap the body for a real API call and nothing else
+   in the app has to change. A tool returns:
+       { result: <JSON the model sees>, card: <optional UI card> }
+   =========================================================================== */
+
+const TOOLS = [
+  {
+    name:'get_booking',
+    description:'Look up the current reservation: passenger, flight, fare class, loyalty tier, and currently assigned seat.',
+    input_schema:{ type:'object', properties:{}, required:[] },
+    run() {
+      const s = SEAT_INVENTORY[state.assignedSeat];
+      return { result:{
+        pnr:BOOKING.pnr, passenger:BOOKING.name, flight:BOOKING.flight,
+        route:BOOKING.origin + '-' + BOOKING.destination, date:BOOKING.date,
+        fareClass:BOOKING.fareClass, loyaltyTier:BOOKING.tier,
+        assignedSeat:state.assignedSeat,
+        assignedSeatTraits: s ? seatTraits(s) : []
+      }};
+    }
+  },
+  {
+    name:'search_seats',
+    description:'Find available seats matching a preference. Use this before recommending anything so you never offer a seat that is taken.',
+    input_schema:{ type:'object', properties:{
+      preference:{ type:'string', enum:['window','aisle','extra_legroom','exit_row','first_class','any'],
+        description:'What the customer is looking for' },
+      max_price:{ type:'number', description:'Maximum change fee in USD the customer will pay' },
+      count:{ type:'number', description:'How many options to return (default 3)' }
+    }, required:['preference'] },
+    run(input) {
+      const pref = input.preference || 'any';
+      const max = typeof input.max_price === 'number' ? input.max_price : Infinity;
+      const count = Math.min(input.count || 3, 5);
+      let pool = Object.values(SEAT_INVENTORY)
+        .filter(s => !s.occupied && s.code !== state.assignedSeat && s.price <= max);
+
+      if (pref === 'window')            pool = pool.filter(s => s.window);
+      else if (pref === 'aisle')        pool = pool.filter(s => s.aisle);
+      else if (pref === 'extra_legroom')pool = pool.filter(s => s.extraLegroom);
+      else if (pref === 'exit_row')     pool = pool.filter(s => s.exitRow);
+      else if (pref === 'first_class')  pool = pool.filter(s => s.cabin === 'fc');
+
+      pool.sort((a,b) => (a.price - b.price) || (a.row - b.row));
+      const picks = pool.slice(0, count);
+
+      state.suggested = picks.map(s => s.code);
+      renderMap();
+
+      return {
+        result:{ matches:picks.length, seats:picks.map(s => ({
+          seat:s.code, cabin:s.cabinName, changeFee:s.price, pitch:s.pitch, traits:seatTraits(s)
+        }))},
+        card: picks.length ? { kind:'options', seats:picks } : null
+      };
+    }
+  },
+  {
+    name:'get_seat_details',
+    description:'Get full detail on one specific seat, including whether it is available.',
+    input_schema:{ type:'object', properties:{
+      seat:{ type:'string', description:'Seat code such as 14C' } }, required:['seat'] },
+    run(input) {
+      const s = SEAT_INVENTORY[String(input.seat || '').toUpperCase()];
+      if (!s) return { result:{ error:'No such seat on this aircraft.' } };
+      return { result:{ seat:s.code, available:!s.occupied, cabin:s.cabinName,
+        changeFee:s.price, pitch:s.pitch, traits:seatTraits(s) } };
+    }
+  },
+  {
+    name:'price_seat_change',
+    description:'Price a move from the currently assigned seat to a target seat. Always call this before asking the customer to confirm.',
+    input_schema:{ type:'object', properties:{
+      to_seat:{ type:'string', description:'Target seat code' } }, required:['to_seat'] },
+    run(input) {
+      const to = SEAT_INVENTORY[String(input.to_seat || '').toUpperCase()];
+      if (!to) return { result:{ error:'Unknown seat.' } };
+      if (to.occupied) return { result:{ error:'That seat is no longer available.' } };
+      // Loyalty waiver - the kind of rule worth demonstrating.
+      const waiver = (BOOKING.tier === 'Gold' || BOOKING.tier === 'Platinum') && to.price <= 45;
+      const total = waiver ? 0 : to.price;
+      state.pendingSeat = to.code;
+      renderMap();
+      return {
+        result:{ from:state.assignedSeat, to:to.code, baseFee:to.price,
+          loyaltyWaiver:waiver, waiverReason: waiver ? BOOKING.tier + ' member - seat fees waived up to $45' : null,
+          total, currency:'USD' },
+        card:{ kind:'price', to, baseFee:to.price, waiver, total }
+      };
+    }
+  },
+  {
+    name:'assign_seat',
+    description:'Commit the seat change on the reservation. Only call after the customer has explicitly agreed to the price.',
+    input_schema:{ type:'object', properties:{
+      seat:{ type:'string', description:'Seat code to assign' } }, required:['seat'] },
+    run(input) {
+      const to = SEAT_INVENTORY[String(input.seat || '').toUpperCase()];
+      if (!to || to.occupied) return { result:{ error:'Seat unavailable.' } };
+      const prev = state.assignedSeat;
+      if (SEAT_INVENTORY[prev]) SEAT_INVENTORY[prev].occupied = false;
+      to.occupied = false;
+      state.assignedSeat = to.code;
+      state.pendingSeat = null;
+      state.suggested = [];
+      state.unresolved = 0;
+      persist(); renderMap(); renderStatus();
+      return {
+        result:{ ok:true, previousSeat:prev, assignedSeat:to.code, confirmation:BOOKING.pnr + '-' + to.code },
+        card:{ kind:'confirmed', seat:to, prev }
+      };
+    }
+  },
+  {
+    name:'get_policy',
+    description:'Look up airline policy. Use for factual questions rather than guessing.',
+    input_schema:{ type:'object', properties:{
+      topic:{ type:'string', enum:['baggage','seat_change','exit_row_eligibility','boarding','pets','wifi'] }
+    }, required:['topic'] },
+    run(input) {
+      const P = {
+        baggage:{ title:'Checked baggage',
+          body:'First bag $35, second $45. ' + BOOKING.tier + ' members receive two free checked bags. Carry-on plus one personal item is always included.' },
+        seat_change:{ title:'Seat changes',
+          body:'Seats may be changed free of charge up to 24 hours before departure; inside 24 hours a change fee applies. Fees are waived for Gold and Platinum members on seats up to $45.' },
+        exit_row_eligibility:{ title:'Exit row seating',
+          body:'Passengers must be 15 or older, physically able to assist in an evacuation, and willing to do so. Exit rows cannot be assigned to travellers with infants or requiring assistance.' },
+        boarding:{ title:'Boarding',
+          body:'Boarding opens 40 minutes before departure. ' + BOOKING.tier + ' members board in Group 2.' },
+        pets:{ title:'Travelling with pets',
+          body:'One carrier per passenger in cabin, $125 each way, must fit under the seat in front. Not permitted in exit rows or the first row of any cabin.' },
+        wifi:{ title:'Wi-Fi',
+          body:'Free messaging for all passengers. Full browsing $8 per flight, complimentary in First Class.' }
+      };
+      const p = P[input.topic];
+      if (!p) return { result:{ error:'No policy on file for that topic.' } };
+      return { result:p, card:{ kind:'policy', title:p.title, body:p.body } };
+    }
+  },
+  {
+    name:'escalate_to_agent',
+    description:'Hand the conversation to a live human agent. Use ONLY when the request genuinely cannot be completed with the other tools - refunds, compensation, medical or accessibility needs, complaints, disruptions, or an explicit request for a person. Do not escalate a question you can answer.',
+    input_schema:{ type:'object', properties:{
+      reason:{ type:'string', description:'Short machine-readable reason, e.g. refund_request, accessibility, explicit_request' },
+      summary:{ type:'string', description:'Two or three sentences the agent should read before saying hello' },
+      urgency:{ type:'string', enum:['normal','high'] }
+    }, required:['reason','summary'] },
+    run(input) {
+      const payload = buildNccContext(input.reason, input.summary, input.urgency || 'normal');
+      state.lastPayload = payload;
+      refreshDebug();
+      return {
+        result:{ ok:true, staged:true, note:'Escalation card shown. The customer must press Connect - do not assume an agent is present yet.' },
+        card:{ kind:'escalate', reason:input.reason, summary:input.summary, payload }
+      };
+    }
+  }
+];
+
+const TOOL_BY_NAME = Object.fromEntries(TOOLS.map(t => [t.name, t]));
+const TOOL_SCHEMAS = TOOLS.map(({ name, description, input_schema }) => ({ name, description, input_schema }));
+
+function runTool(name, input) {
+  const tool = TOOL_BY_NAME[name];
+  if (!tool) return { result:{ error:'Unknown tool ' + name } };
+  let out;
+  try { out = tool.run(input || {}); }
+  catch (err) { out = { result:{ error:String(err && err.message || err) } }; }
+  state.toolLog.push({ at:new Date().toISOString(), name, input, result:out.result });
+  refreshDebug();
+  return out;
+}
+
+/* ===========================================================================
+   [SEAM 3]  AI ENGINE
+   ---------------------------------------------------------------------------
+   mock : deterministic intent matcher. No key, no network, demo-safe.
+   live : real Claude via your serverless proxy. Same tools, same UI - the
+          only difference is who decides which tool to call.
+   =========================================================================== */
+
+const SYSTEM_PROMPT = [
+  'You are the travel assistant for Generic Airline, embedded in the seat-selection page.',
+  'The customer is ' + BOOKING.name + ' (' + BOOKING.tier + '), booking ' + BOOKING.pnr + ', flight ' + BOOKING.flight +
+    ' ' + BOOKING.origin + '-' + BOOKING.destination + ' on ' + BOOKING.date + '.',
+  '',
+  'Rules:',
+  '- Resolve the request yourself whenever the tools allow it. You are the first and usually the only line of support.',
+  '- Never state a seat, price, or policy you have not obtained from a tool. Do not guess availability.',
+  '- Call price_seat_change before asking anyone to confirm, and assign_seat only after they agree.',
+  '- Keep replies to two or three short sentences. The UI renders the details as cards, so do not repeat lists in prose.',
+  '- Escalate only when the request is genuinely outside the tools: refunds, compensation, accessibility or medical needs,',
+  '  complaints, irregular operations, or a direct request for a human. A question you can answer is not an escalation.',
+  '- When you do escalate, write the summary for the agent, not for the customer.'
+].join('\n');
+
+/* --- live mode: manual tool-use loop against the proxy ------------------- */
+
+async function callProxy(body) {
+  const res = await fetch(CONFIG.proxyUrl, {
+    method:'POST', headers:{ 'Content-Type':'application/json' }, body:JSON.stringify(body)
+  });
+  if (!res.ok) throw new Error('Proxy returned ' + res.status + ': ' + (await res.text()).slice(0, 200));
+  return res.json();
+}
+
+async function liveTurn(userText) {
+  state.messages.push({ role:'user', content:userText });
+  const cards = [];
+  let text = '';
+
+  for (let i = 0; i < 8; i++) {
+        const reply = await callProxy({
+      model: CONFIG.model,
+      max_tokens: 2048,
+      output_config: { effort: 'low' },   // chat latency matters more than depth here
+      system: SYSTEM_PROMPT,
+      tools: TOOL_SCHEMAS,
+      messages: state.messages
+    });
+
+    state.messages.push({ role:'assistant', content:reply.content });
+
+    const toolUses = (reply.content || []).filter(b => b.type === 'tool_use');
+    text = (reply.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+
+    if (reply.stop_reason !== 'tool_use' || !toolUses.length) break;
+
+    if (text) renderMessage('ai', text);
+    const results = [];
+    for (const use of toolUses) {
+      renderToolCall(use.name, use.input);
+      const out = runTool(use.name, use.input);
+      if (out.card) cards.push(out.card);
+      results.push({ type:'tool_result', tool_use_id:use.id, content:JSON.stringify(out.result) });
+    }
+    state.messages.push({ role:'user', content:results });
+    text = '';
+  }
+  return { text, cards };
+}
+
+/* --- mock mode: scripted intent engine ---------------------------------- */
+
+const MATCH = (t, ...words) => words.some(w => t.includes(w));
+
+function mockTurn(userText) {
+  const t = userText.toLowerCase();
+  const seq = [];
+  const say = s => seq.push({ type:'text', text:s });
+  const call = (name, input) => seq.push({ type:'tool', name, input });
+
+  const seatMention = (userText.toUpperCase().match(/\b(\d{1,2})\s?([A-F])\b/) || [])[0];
+
+  // --- escalation intents: things the tools genuinely cannot do ---
+  if (MATCH(t,'refund','money back','compensat','reimburse')) {
+    say("Refunds are handled by our service team rather than from here — let me bring someone in with your booking already open.");
+    call('escalate_to_agent', { reason:'refund_request', urgency:'normal',
+      summary:'Customer is requesting a refund on ' + BOOKING.pnr + ' (' + BOOKING.flight + ' ' + BOOKING.origin + '-' + BOOKING.destination +
+        '). Not actionable through self-service. Seat currently ' + state.assignedSeat + '. No fare rules reviewed yet.' });
+    return seq;
+  }
+  if (MATCH(t,'wheelchair','disabilit','accessib','medical','oxygen','assistance animal','service animal')) {
+    say("Accessibility requests need a person to review them properly — I don't want to get this wrong. Connecting you now.");
+    call('escalate_to_agent', { reason:'accessibility', urgency:'high',
+      summary:'Customer raised an accessibility/medical requirement on ' + BOOKING.pnr + '. Requires human review and may affect seat eligibility (exit rows excluded). Currently in ' + state.assignedSeat + '.' });
+    return seq;
+  }
+  if (MATCH(t,'agent','human','person','representative','someone real','speak to a')) {
+    say("Of course — connecting you to an agent. Everything we've covered goes across with you.");
+    call('escalate_to_agent', { reason:'explicit_request', urgency:'normal',
+      summary:'Customer explicitly asked for a human agent. Self-service context: seat ' + state.assignedSeat +
+        ', ' + state.turns + ' prior turns with the assistant. See transcript for detail.' });
+    return seq;
+  }
+  if (MATCH(t,'complain','terrible','awful','unacceptable','ridiculous','worst')) {
+    say("I'm sorry — that's not the experience we want. Let me get you to someone who can actually make it right.");
+    call('escalate_to_agent', { reason:'complaint', urgency:'high',
+      summary:'Customer expressed strong dissatisfaction. Recommend a service-recovery review. Booking ' + BOOKING.pnr + ', seat ' + state.assignedSeat + '.' });
+    return seq;
+  }
+
+  // --- confirm / accept ---
+  if (state.pendingSeat && MATCH(t,'yes','yep','confirm','book it','do it','take it','sounds good','please do','go ahead','sure')) {
+    call('assign_seat', { seat:state.pendingSeat });
+    say("Done — you're all set. Your boarding pass will refresh automatically.");
+    return seq;
+  }
+
+  // --- a specific seat named ---
+  if (seatMention) {
+    const code = seatMention.replace(/\s/g,'').toUpperCase();
+    call('get_seat_details', { seat:code });
+    const s = SEAT_INVENTORY[code];
+    if (!s)             say("I can't find " + code + " on this aircraft — it's a 20-row layout, so rows go up to 20.");
+    else if (s.occupied)say(code + " is already taken, unfortunately. Tell me what you liked about it and I'll find the closest match.");
+    else { call('price_seat_change', { to_seat:code }); say("Here's what " + code + " would cost. Want me to lock it in?"); }
+    return seq;
+  }
+
+  // --- seat search intents ---
+  if (MATCH(t,'window'))        { call('search_seats',{preference:'window',count:3});        say("Here are the best windows still open. Tap one and I'll price it."); return seq; }
+  if (MATCH(t,'aisle'))         { call('search_seats',{preference:'aisle',count:3});         say("These aisles are available. Any of them work?"); return seq; }
+  if (MATCH(t,'exit row','exit')){ call('search_seats',{preference:'exit_row',count:3});     say("Exit rows have the most room in the cabin. Worth noting there's an eligibility check at the gate."); return seq; }
+  if (MATCH(t,'legroom','leg room','tall','more room','stretch','knee')) {
+    call('search_seats',{preference:'extra_legroom',count:3});
+    say("These give you the most space. Exit rows are the roomiest at 36 inches of pitch."); return seq;
+  }
+  if (MATCH(t,'first class','upgrade','business')) {
+    call('search_seats',{preference:'first_class',count:3});
+    say("First Class is open on this flight. As a " + BOOKING.tier + " member you'd also get priority boarding and two free bags."); return seq;
+  }
+  if (MATCH(t,'middle','stuck','cramped','bad seat','change my seat','move seat','different seat','switch seat','change seat')) {
+    call('get_booking', {});
+    call('search_seats',{preference:'aisle',count:3});
+    say("You're in " + state.assignedSeat + " right now — a middle seat near the back. Here are three better options."); return seq;
+  }
+
+  // --- policy intents ---
+  if (MATCH(t,'bag','luggage','suitcase','checked')) { call('get_policy',{topic:'baggage'}); return seq; }
+  if (MATCH(t,'pet','dog','cat'))                    { call('get_policy',{topic:'pets'}); return seq; }
+  if (MATCH(t,'wifi','wi-fi','internet'))            { call('get_policy',{topic:'wifi'}); return seq; }
+  if (MATCH(t,'board','group','zone'))               { call('get_policy',{topic:'boarding'}); return seq; }
+  if (MATCH(t,'fee','cost','charge','how much','price') && !seatMention) {
+    call('get_policy',{topic:'seat_change'});
+    say("As a " + BOOKING.tier + " member most seat changes are free for you. Want me to find something better than " + state.assignedSeat + "?");
+    return seq;
+  }
+  if (MATCH(t,'hello','hi ','hey','good morning','good afternoon')) {
+    say("Hi " + BOOKING.name.split(' ')[0] + " — I can move your seat, quote an upgrade, or answer questions about " + BOOKING.flight + ". What do you need?");
+    return seq;
+  }
+
+  // --- nothing matched ---
+  state.unresolved++;
+  if (state.unresolved >= 2) {
+    say("I don't think I'm getting you what you need. Let me hand this to an agent rather than keep guessing.");
+    call('escalate_to_agent', { reason:'unresolved_after_attempts', urgency:'normal',
+      summary:'Assistant could not resolve the request after ' + state.unresolved + ' attempts. Last message: "' +
+        userText.slice(0,140) + '". Booking ' + BOOKING.pnr + ', seat ' + state.assignedSeat + '.' });
+    return seq;
+  }
+  say("I can help with seats, upgrades, bags, boarding and Wi-Fi on " + BOOKING.flight + ". Could you say a bit more about what you're after?");
+  return seq;
+}
+
+async function runMock(userText) {
+  const seq = mockTurn(userText);
+  const cards = [];
+  let text = '';
+  for (const step of seq) {
+    if (step.type === 'text') { text = step.text; continue; }
+    renderToolCall(step.name, step.input);
+    await sleep(420);
+    const out = runTool(step.name, step.input);
+    if (out.card) cards.push(out.card);
+  }
+  return { text, cards };
+}
+
+/* ===========================================================================
+   [SEAM 4]  NCC HANDOFF
+   ---------------------------------------------------------------------------
+   Verified against thriowidgets-1.2.1.js: the widget builds
+     {protocol}://{host}/survey/?tenant=..&campaignId=..&trace=..&context=<urlencoded JSON>
+   Context travels in the QUERY STRING. Two consequences drive the code below:
+     1. It is size-limited. Never put a transcript in it - send an id.
+     2. It is visible and editable by the customer. Never put anything
+        trust-bearing (price, entitlement, fare authority) in it. Re-derive
+        money server-side from the PNR.
+   Every key here is readable in the agent's survey as ${workitem.data?.<key>}
+   =========================================================================== */
+
+function buildNccContext(reason, summary, urgency) {
+  const s = SEAT_INVENTORY[state.assignedSeat] || {};
+  const transcriptId = 'tx-' + BOOKING.pnr + '-' + Date.now().toString(36);
+
+  // Values are stringified: a numeric 0 can read as empty in survey conditionals.
+  return {
+    // --- booking identity: what the agent needs to find the customer ---
+    pnr:              BOOKING.pnr,
+    passengerName:    BOOKING.name,
+    passengerEmail:   BOOKING.email,
+    loyaltyTier:      BOOKING.tier,
+    flightNumber:     BOOKING.flight,
+    route:            BOOKING.origin + '-' + BOOKING.destination,
+    departureDate:    BOOKING.date,
+
+    // --- seat state ---
+    seatSummary:      state.assignedSeat + ' · ' + (s.cabinName || '') + ' · ' + seatTraits(s).join(', '),
+    selectedSeat:     String(state.assignedSeat),
+    selectedCabin:    String(s.cabin || ''),
+    selectedCabinName:String(s.cabinName || ''),
+    selectedSeatRow:  String(s.row || ''),
+    selectedSeatColumn:String(s.col || ''),
+
+    // --- what the AI already did: the reason this handoff is warm ---
+    aiHandled:        'true',
+    aiTurns:          String(state.turns),
+    aiToolCalls:      String(state.toolLog.length),
+    escalationReason: reason,
+    escalationUrgency:urgency,
+    aiSummary:        summary,
+    transcriptId:     transcriptId,
+
+    // --- routing ---
+    routingHint:      s.cabin === 'fc' ? 'premium' : (urgency === 'high' ? 'priority' : 'standard')
+  };
+}
+
+function nccSurveyUrl(context) {
+  const c = CONFIG.ncc;
+  return c.protocol + '://' + c.host + '/survey/?tenant=' + encodeURIComponent(c.tenantId) +
+    '&campaignId=' + encodeURIComponent(c.campaignId) + '&trace=' + c.trace +
+    '&context=' + encodeURIComponent(JSON.stringify(context));
+}
+
+let nccLoaded = false;
+
+function launchNcc(context) {
+  if (nccLoaded) return;
+  nccLoaded = true;
+    state.escalated = true;
+
+  const url = nccSurveyUrl(context);
+  if (url.length > 4000) {
+    console.warn('[NCC] context URL is ' + url.length + ' chars - trim fields before this reaches production.');
+  }
+
+  if (CONFIG.handoff === 'iframe') {
+    // Direct embed: we control size, placement and chrome. Same destination.
+    document.getElementById('nccFrame').src = url;
+    document.getElementById('nccHost').classList.add('on');
+  } else {
+    // Official widget: set params first, then load - the bundle reads
+    // window.thrioParams on the window 'load' event.
+    window.thrioParams = {
+      protocol: CONFIG.ncc.protocol, host: CONFIG.ncc.host,
+      tenantId: CONFIG.ncc.tenantId, campaignId: CONFIG.ncc.campaignId,
+      trace: CONFIG.ncc.trace,
+      colors: { buttonColor:'#ffffff', buttonBackground:'#003087' },
+      properties: { showHeader:true, showCloseButton:true, showMinimizeButton:true },
+      context
+    };
+    const script = document.createElement('script');
+    script.type = 'module';
+    script.src = 'https://storage.googleapis.com/thrio-public-prod-files/thriowidgets-1.2.1.js';
+    script.onerror = () => renderMessage('system', 'Live chat failed to load. Please call 1-800-555-0142.');
+    document.head.appendChild(script);
+  }
+
+  document.getElementById('chatBadge').textContent = 'Live agent';
+  document.getElementById('chatBadge').className = 'agent-badge';
+  document.getElementById('chatTitle').textContent = 'Connected to an agent';
+  renderMessage('system', 'Transferred to a live agent — your seat details and this conversation went with you.');
+  renderMap();
+}
+
+document.getElementById('nccClose').addEventListener('click', () => {
+  document.getElementById('nccHost').classList.remove('on');
+});
+
+/* ===========================================================================
+   RENDERING
+   =========================================================================== */
+
+const msgsEl = document.getElementById('msgs');
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function scrollDown() { msgsEl.scrollTop = msgsEl.scrollHeight; }
+
+function renderMessage(role, text) {
+  const wrap = document.createElement('div');
+  wrap.className = 'msg ' + role;
+  if (role === 'system') {
+    wrap.innerHTML = '<div class="bubble"></div>';
+    wrap.querySelector('.bubble').textContent = text;
+  } else {
+    const who = role === 'ai' ? 'AI' : (BOOKING.name[0] || 'Y');
+    wrap.innerHTML = '<div class="avatar"></div><div class="bubble"></div>';
+    wrap.querySelector('.avatar').textContent = who;
+    wrap.querySelector('.bubble').textContent = text;
+  }
+  msgsEl.appendChild(wrap);
+  scrollDown();
+  if (role !== 'user') state.transcript.push({ role, text });
+  if (role === 'ai') flagUnread();
+}
+
+function renderToolCall(name, input) {
+  const el = document.createElement('div');
+  el.className = 'toolcall';
+  const args = Object.entries(input || {}).map(([k,v]) => k + ': ' + JSON.stringify(v)).join(', ');
+  el.innerHTML = '&#9881; calling <b></b>(<span></span>)';
+  el.querySelector('b').textContent = name;
+  el.querySelector('span').textContent = args;
+  msgsEl.appendChild(el);
+  scrollDown();
+}
+
+function showThinking() {
+  const el = document.createElement('div');
+  el.className = 'msg ai'; el.id = 'thinkingRow';
+  el.innerHTML = '<div class="avatar">AI</div><div class="bubble thinking"><span></span><span></span><span></span></div>';
+  msgsEl.appendChild(el); scrollDown();
+}
+function hideThinking() { const el = document.getElementById('thinkingRow'); if (el) el.remove(); }
+
+function card(kind, headText, bodyNode) {
+  const el = document.createElement('div');
+  el.className = 'card' + (kind === 'escalate' ? ' escalate' : '');
+  const head = document.createElement('div');
+  head.className = 'card-head'; head.textContent = headText;
+  const body = document.createElement('div');
+  body.className = 'card-body'; body.appendChild(bodyNode);
+  el.appendChild(head); el.appendChild(body);
+  msgsEl.appendChild(el); scrollDown();
+  return el;
+}
+
+function renderCard(c) {
+  if (!c) return;
+
+  if (c.kind === 'options') {
+    const box = document.createElement('div');
+    c.seats.forEach(s => {
+      const row = document.createElement('div');
+      row.className = 'opt';
+      row.innerHTML =
+        '<div class="opt-seat"></div>' +
+        '<div class="opt-info"><div class="t"></div><div class="d"></div></div>' +
+        '<div class="opt-price"></div>' +
+        '<button class="btn btn-primary">Select</button>';
+      row.querySelector('.opt-seat').textContent = s.code;
+      row.querySelector('.t').textContent = s.cabinName;
+      row.querySelector('.d').textContent = seatTraits(s).join(' · ') + ' · ' + s.pitch + ' pitch';
+      const free = (BOOKING.tier === 'Gold' || BOOKING.tier === 'Platinum') && s.price <= 45;
+      const price = row.querySelector('.opt-price');
+      price.textContent = free ? 'Free' : '$' + s.price;
+      if (free) price.classList.add('free');
+      row.querySelector('button').addEventListener('click', () => send('I’ll take ' + s.code));
+      box.appendChild(row);
+    });
+    card('options', 'Available seats', box);
+    return;
+  }
+
+  if (c.kind === 'price') {
+    const box = document.createElement('div');
+    const rows = [
+      ['Moving to', c.to.code + ' · ' + c.to.cabinName],
+      ['Seat fee', '$' + c.baseFee]
+    ];
+    if (c.waiver) rows.push([BOOKING.tier + ' waiver', '− $' + c.baseFee]);
+    box.innerHTML = rows.map(([k,v]) =>
+      '<div class="kv"><span class="k">' + k + '</span><span class="v">' + v + '</span></div>').join('') +
+      '<div class="kv total"><span class="k">Total due</span><span class="v">' +
+      (c.total === 0 ? 'No charge' : '$' + c.total) + '</span></div>';
+    const btn = document.createElement('button');
+    btn.className = 'btn btn-ok btn-wide';
+    btn.textContent = 'Confirm ' + c.to.code;
+    btn.addEventListener('click', () => send('Yes, confirm ' + c.to.code));
+    box.appendChild(btn);
+    card('price', 'Seat change quote', box);
+    return;
+  }
+
+  if (c.kind === 'confirmed') {
+    const box = document.createElement('div');
+    box.innerHTML =
+      '<div class="kv"><span class="k">Previous seat</span><span class="v">' + c.prev + '</span></div>' +
+      '<div class="kv"><span class="k">New seat</span><span class="v">' + c.seat.code + '</span></div>' +
+      '<div class="kv"><span class="k">Cabin</span><span class="v">' + c.seat.cabinName + '</span></div>' +
+      '<div class="kv total"><span class="k">Confirmation</span><span class="v">' + BOOKING.pnr + '-' + c.seat.code + '</span></div>';
+    card('confirmed', '✓ Seat confirmed', box);
+    return;
+  }
+
+  if (c.kind === 'policy') {
+    const box = document.createElement('div');
+    box.style.cssText = 'font-size:12px;line-height:1.6';
+    box.textContent = c.body;
+    card('policy', c.title, box);
+    return;
+  }
+
+  if (c.kind === 'escalate') {
+    const box = document.createElement('div');
+    const p = document.createElement('div');
+    p.style.cssText = 'font-size:12px;line-height:1.55;margin-bottom:4px';
+    p.textContent = c.summary;
+    const note = document.createElement('div');
+    note.style.cssText = 'font-size:10.5px;color:#5b6b7f;margin-top:8px;font-weight:700';
+    note.textContent = 'The agent will already have:';
+    const ul = document.createElement('ul');
+    ul.className = 'handoff-list';
+    ul.innerHTML =
+      '<li>Booking <code>' + c.payload.pnr + '</code> &mdash; ' + c.payload.passengerName + ' (' + c.payload.loyaltyTier + ')</li>' +
+      '<li>Seat <code>' + c.payload.seatSummary + '</code></li>' +
+      '<li>Reason <code>' + c.payload.escalationReason + '</code> &middot; routing <code>' + c.payload.routingHint + '</code></li>' +
+      '<li>' + c.payload.aiTurns + ' turns of context, transcript <code>' + c.payload.transcriptId + '</code></li>';
+    const btn = document.createElement('button');
+    btn.className = 'btn btn-primary btn-wide';
+    btn.textContent = 'Connect me to an agent →';
+    btn.addEventListener('click', () => {
+      btn.disabled = true; btn.textContent = 'Connecting…';
+      launchNcc(c.payload);
+    });
+    box.appendChild(p); box.appendChild(note); box.appendChild(ul); box.appendChild(btn);
+    card('escalate', 'Handing off to a person', box);
+    return;
+  }
+}
+
+/* --- seat map --- */
+
+function renderMap() {
+  const map = document.getElementById('seatMap');
+  map.innerHTML = '';
+  CABINS.forEach((cab, idx) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'cabin';
+    const h = document.createElement('div');
+    h.className = 'cabin-header';
+    h.style.color = { fc:'#9C27B0', xl:'#2196F3', ex:'#795548', av:'#2E7D32' }[cab.type];
+    h.textContent = cab.label;
+    wrap.appendChild(h);
+
+    if (idx === 0) {
+      const ch = document.createElement('div');
+      ch.className = 'col-headers';
+      ch.innerHTML = '<span>A</span><span>B</span><span>C</span><span class="gap"></span><span>D</span><span>E</span><span>F</span>';
+            wrap.appendChild(ch);
+    }
+
+    cab.rows.forEach(rowNum => {
+      const row = document.createElement('div');
+      row.className = 'row';
+      const rn = document.createElement('span');
+      rn.className = 'row-num'; rn.textContent = rowNum;
+      row.appendChild(rn);
+
+      COLS.forEach((col, ci) => {
+        const s = SEAT_INVENTORY[rowNum + col];
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        const isMine = s.code === state.assignedSeat;
+        const classes = ['seat', s.cabin];
+        if (isMine) classes.push('mine');
+        else if (s.occupied) classes.push('taken');
+        if (s.code === state.pendingSeat) classes.push('selected');
+        if (state.suggested.includes(s.code)) classes.push('suggested');
+        btn.className = classes.join(' ');
+        btn.textContent = isMine ? '★' : (s.occupied ? '✕' : col);
+        btn.title = s.code + (isMine ? ' (your seat)' : '') + ' — ' + seatTraits(s).join(', ');
+        btn.setAttribute('aria-label', 'Seat ' + s.code + ', ' + (s.occupied && !isMine ? 'unavailable' : seatTraits(s).join(', ')));
+        btn.disabled = (s.occupied && !isMine) || state.escalated;
+        if (!btn.disabled && !isMine) btn.addEventListener('click', () => send('Tell me about ' + s.code));
+        row.appendChild(btn);
+        if (ci === 2) { const g = document.createElement('span'); g.className = 'gap'; row.appendChild(g); }
+      });
+      wrap.appendChild(row);
+    });
+    map.appendChild(wrap);
+  });
+
+  document.getElementById('mapLock').textContent = state.escalated
+    ? 'Seat map locked — ask your agent to make further changes.'
+    : 'Tap any open seat, or just ask the assistant.';
+}
+
+function renderStatus() {
+  const s = SEAT_INVENTORY[state.assignedSeat];
+  const box = document.getElementById('seatStatus');
+  document.getElementById('seatVal').textContent = state.assignedSeat;
+  document.getElementById('seatSub').textContent = s ? (s.cabinName + ' · ' + seatTraits(s).join(' · ')) : '';
+  box.classList.toggle('assigned', state.assignedSeat !== BOOKING.currentSeat);
+}
+
+function renderFlightStrip() {
+  const strip = document.getElementById('flightStrip');
+  [['PNR', BOOKING.pnr], ['Flight', BOOKING.flight],
+   ['', BOOKING.origin + ' → ' + BOOKING.destination], ['', BOOKING.date],
+   ['', BOOKING.name + ' · ' + BOOKING.tier]].forEach(([k, v]) => {
+    const c = document.createElement('div');
+    c.className = 'chip';
+    c.innerHTML = (k ? k + ' ' : '') + '<b></b>';
+    c.querySelector('b').textContent = v;
+    strip.appendChild(c);
+  });
+}
+
+/* --- quick replies --- */
+
+const QUICK = ['I’m stuck in a middle seat', 'Any window seats?', 'How much for extra legroom?',
+  'What’s the baggage allowance?', 'I need a refund'];
+
+function renderQuickies() {
+  const box = document.getElementById('quickies');
+  box.innerHTML = '';
+  if (state.escalated) return;
+  QUICK.forEach(q => {
+    const b = document.createElement('button');
+    b.type = 'button'; b.textContent = q;
+    b.addEventListener('click', () => send(q));
+    box.appendChild(b);
+  });
+}
+
+/* --- mobile tabs --- */
+
+function flagUnread() {
+  if (document.getElementById('layout').classList.contains('tab-chat')) return;
+  document.getElementById('chatDot').classList.add('on');
+}
+document.getElementById('tabs').addEventListener('click', e => {
+  const b = e.target.closest('button[data-tab]');
+  if (!b) return;
+  document.querySelectorAll('#tabs button').forEach(x => x.classList.remove('active'));
+  b.classList.add('active');
+  const layout = document.getElementById('layout');
+  layout.className = 'layout tab-' + b.dataset.tab;
+  if (b.dataset.tab === 'chat') document.getElementById('chatDot').classList.remove('on');
+});
+
+/* ===========================================================================
+   CONVERSATION LOOP
+   =========================================================================== */
+
+let busy = false;
+
+async function send(text) {
+  if (busy || !text.trim()) return;
+  if (state.escalated) {
+    renderMessage('system', 'You are with a live agent now — use the agent chat window.');
+    return;
+  }
+  busy = true;
+  state.turns++;
+  renderMessage('user', text);
+  state.transcript.push({ role:'user', text });
+  document.getElementById('input').value = '';
+  showThinking();
+
+  try {
+    const { text: reply, cards } =
+      CONFIG.aiMode === 'live' && CONFIG.proxyUrl ? await liveTurn(text) : await runMock(text);
+    hideThinking();
+    if (reply) renderMessage('ai', reply);
+    cards.forEach(renderCard);
+  } catch (err) {
+    hideThinking();
+    console.error(err);
+    renderMessage('system', 'The assistant is unavailable. ' + (err.message || ''));
+    renderCard({ kind:'escalate', reason:'assistant_error',
+      summary:'The AI assistant errored out. Customer has not been helped yet.',
+      payload: buildNccContext('assistant_error', 'AI assistant failed; customer needs a human.', 'normal') });
+  }
+
+  busy = false;
+  renderQuickies();
+  refreshDebug();
+}
+
+document.getElementById('composer').addEventListener('submit', e => {
+  e.preventDefault();
+  send(document.getElementById('input').value);
+});
+
+/* ===========================================================================
+   DEBUG PANEL  (?debug=1)
+   =========================================================================== */
+
+let dbgTab = 'ctx';
+
+function refreshDebug() {
+  if (!CONFIG.debug) return;
+  const out = document.getElementById('dbgOut');
+  if (dbgTab === 'ctx') {
+    const ctx = state.lastPayload ||
+      buildNccContext('(not escalated yet)', 'Preview only - no escalation has happened.', 'normal');
+    const url = nccSurveyUrl(ctx);
+    const keys = Object.keys(ctx).map(k => '  ${workitem.data?.' + k + '}').join('\n');
+    out.textContent =
+      '// context object handed to NCC\n' + JSON.stringify(ctx, null, 2) +
+      '\n\n// survey expressions - paste these into the NCC survey builder\n' + keys +
+      '\n\n// resulting iframe URL (' + url.length + ' chars)\n' + url;
+    const size = document.getElementById('dbgSize');
+    size.textContent = url.length + ' chars';
+    size.classList.toggle('warn', url.length > 2000);
+  } else if (dbgTab === 'tools') {
+    out.textContent = state.toolLog.length
+      ? state.toolLog.map(t => t.name + '(' + JSON.stringify(t.input) + ')\n  -> ' + JSON.stringify(t.result)).join('\n\n')
+      : 'No tool calls yet.';
+  } else {
+    out.textContent = state.transcript.map(m => m.role.toUpperCase() + ': ' + m.text).join('\n\n') || 'Empty.';
+  }
+}
+
+document.querySelector('#debug .dbg-tabs').addEventListener('click', e => {
+  const b = e.target.closest('button[data-d]');
+  if (!b) return;
+  if (b.dataset.d === 'close') { document.getElementById('debug').classList.remove('on'); return; }
+  dbgTab = b.dataset.d;
+  document.querySelectorAll('#debug .dbg-tabs button[data-d]').forEach(x => x.classList.remove('active'));
+  b.classList.add('active');
+  refreshDebug();
+});
+
+document.getElementById('dbgToggle').addEventListener('click', () => {
+  const open = document.getElementById('debug').classList.toggle('on');
+  document.body.classList.toggle('debug-open', open);
+  refreshDebug();
+});
+
+/* ===========================================================================
+   BOOT
+   =========================================================================== */
+
+renderFlightStrip();
+renderMap();
+renderStatus();
+renderQuickies();
+
+if (CONFIG.debug) {
+  document.getElementById('dbgToggle').classList.add('on');
+  document.getElementById('debug').classList.add('on');
+  document.body.classList.add('debug-open');
+  refreshDebug();
+}
+
+renderMessage('ai',
+  'Hi ' + BOOKING.name.split(' ')[0] + ' — I can see your booking for ' + BOOKING.flight + ' to ' +
+  BOOKING.destination + '. You’re currently in ' + state.assignedSeat +
+  '. I can change your seat, quote an upgrade, or answer questions about the flight.');
+
+if (CONFIG.aiMode === 'live' && !CONFIG.proxyUrl) {
+  renderMessage('system', 'ai=live was requested but no &proxy= URL was supplied — running in mock mode.');
+}
+</script>
+</body>
+</html>
